@@ -391,7 +391,6 @@ where
         projection: ProjectionMask,
         batch_size: usize,
     ) -> ReadResult {
-        println!("ReaderFactory::read_row_group {}", row_group_idx);
         // TODO: calling build_array multiple times is wasteful
         let this = Arc::get_mut_unchecked(&mut self);
 
@@ -535,10 +534,7 @@ where
                             e.to_string(),
                         ))));
                     }
-                    None => {
-                        println!("Decoding finished");
-                        self.state = StreamState::Init
-                    },
+                    None => self.state = StreamState::Init,
                 },
                 StreamState::Init => {
                     while self.row_groups_read_queue.len() < self.prefetch {
@@ -560,7 +556,6 @@ where
                             self.selection.as_mut().map(|s| s.split_off(row_count));
 
                         unsafe {
-                            println!("Call ReaderFactory::read_row_group {}", row_group_idx);
                             let fut = self.reader.clone()
                                 .read_row_group(
                                     row_group_idx,

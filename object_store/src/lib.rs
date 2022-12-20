@@ -241,17 +241,12 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         location: &Path,
         ranges: &[Range<usize>],
     ) -> Result<Vec<Bytes>> {
-        println!("{:?} Begin Get Ranges {:?}", SystemTime::now(), ranges);
         let ret = coalesce_ranges(
             ranges,
-            |range| {
-                println!("get_range: coalesced {:?}", range.clone());
-                self.get_range(location, range)
-            },
+            |range| self.get_range(location, range),
             OBJECT_STORE_COALESCE_DEFAULT,
         )
         .await;
-        println!("{:?} Get Ranges {:?} finished", SystemTime::now(), ranges);
         ret
     }
 
