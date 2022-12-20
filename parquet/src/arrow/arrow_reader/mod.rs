@@ -71,6 +71,8 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) filter: Option<RowFilter>,
 
     pub(crate) selection: Option<RowSelection>,
+
+    pub(crate) prefetch: usize,
 }
 
 impl<T> ArrowReaderBuilder<T> {
@@ -100,6 +102,7 @@ impl<T> ArrowReaderBuilder<T> {
             projection: ProjectionMask::all(),
             filter: None,
             selection: None,
+            prefetch: 2usize,
         })
     }
 
@@ -166,6 +169,13 @@ impl<T> ArrowReaderBuilder<T> {
     pub fn with_row_filter(self, filter: RowFilter) -> Self {
         Self {
             filter: Some(filter),
+            ..self
+        }
+    }
+
+    pub fn with_prefetch(self, n: usize) -> Self {
+        Self {
+            prefetch: n,
             ..self
         }
     }

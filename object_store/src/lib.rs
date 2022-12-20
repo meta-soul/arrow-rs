@@ -187,6 +187,7 @@ use snafu::Snafu;
 use std::fmt::{Debug, Formatter};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
+use std::time::SystemTime;
 use tokio::io::AsyncWrite;
 
 /// An alias for a dynamically dispatched object store implementation.
@@ -240,12 +241,18 @@ pub trait ObjectStore: std::fmt::Display + Send + Sync + Debug + 'static {
         location: &Path,
         ranges: &[Range<usize>],
     ) -> Result<Vec<Bytes>> {
-        coalesce_ranges(
+        println!("{:?} Begin Get Ranges {:?}", SystemTime::now(), ranges);
+        let ret = coalesce_ranges(
             ranges,
-            |range| self.get_range(location, range),
+            |range| {
+                println!("get_range: coalesced {:?}", range.clone());
+                self.get_range(location, range)
+            },
             OBJECT_STORE_COALESCE_DEFAULT,
         )
-        .await
+        .await;
+        println!("{:?} Get Ranges {:?} finished", SystemTime::now(), ranges);
+        ret
     }
 
     /// Return the metadata for the specified location

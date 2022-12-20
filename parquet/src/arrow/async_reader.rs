@@ -77,6 +77,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Formatter;
+use std::future::Future;
 
 use std::io::{Cursor, SeekFrom};
 use std::ops::Range;
@@ -89,6 +90,7 @@ use bytes::{Buf, Bytes};
 use futures::future::{BoxFuture, FutureExt};
 use futures::ready;
 use futures::stream::Stream;
+use futures_util::stream::{FuturesOrdered, StreamExt};
 use thrift::protocol::TCompactInputProtocol;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
@@ -341,6 +343,8 @@ impl<T: AsyncFileReader + Send + 'static> ArrowReaderBuilder<AsyncReader<T>> {
             fields: self.fields,
         };
 
+        let prefetch = self.prefetch;
+
         Ok(ParquetRecordBatchStream {
             metadata: self.metadata,
             batch_size,
@@ -348,13 +352,15 @@ impl<T: AsyncFileReader + Send + 'static> ArrowReaderBuilder<AsyncReader<T>> {
             projection: self.projection,
             selection: self.selection,
             schema: self.schema,
-            reader: Some(reader),
+            reader: Arc::new(reader),
             state: StreamState::Init,
+            row_groups_read_queue: FuturesOrdered::new(),
+            prefetch,
         })
     }
 }
 
-type ReadResult<T> = Result<(ReaderFactory<T>, Option<ParquetRecordBatchReader>)>;
+type ReadResult = Result<Option<ParquetRecordBatchReader>>;
 
 /// [`ReaderFactory`] is used by [`ParquetRecordBatchStream`] to create
 /// [`ParquetRecordBatchReader`]
@@ -368,6 +374,9 @@ struct ReaderFactory<T> {
     filter: Option<RowFilter>,
 }
 
+unsafe impl<T> Sync for ReaderFactory<T> {}
+unsafe impl<T> Send for ReaderFactory<T> {}
+
 impl<T> ReaderFactory<T>
 where
     T: AsyncFileReader + Send,
@@ -375,16 +384,18 @@ where
     /// Reads the next row group with the provided `selection`, `projection` and `batch_size`
     ///
     /// Note: this captures self so that the resulting future has a static lifetime
-    async fn read_row_group(
-        mut self,
+    async unsafe fn read_row_group(
+        mut self: Arc<Self>,
         row_group_idx: usize,
         mut selection: Option<RowSelection>,
         projection: ProjectionMask,
         batch_size: usize,
-    ) -> ReadResult<T> {
+    ) -> ReadResult {
+        println!("ReaderFactory::read_row_group {}", row_group_idx);
         // TODO: calling build_array multiple times is wasteful
+        let this = Arc::get_mut_unchecked(&mut self);
 
-        let meta = self.metadata.row_group(row_group_idx);
+        let meta = this.metadata.row_group(row_group_idx);
         let mut row_group = InMemoryRowGroup {
             metadata: meta,
             // schema: meta.schema_descr_ptr(),
@@ -392,19 +403,19 @@ where
             column_chunks: vec![None; meta.columns().len()],
         };
 
-        if let Some(filter) = self.filter.as_mut() {
+        if let Some(filter) = this.filter.as_mut() {
             for predicate in filter.predicates.iter_mut() {
                 if !selects_any(selection.as_ref()) {
-                    return Ok((self, None));
+                    return Ok(None);
                 }
 
                 let predicate_projection = predicate.projection();
                 row_group
-                    .fetch(&mut self.input, predicate_projection, selection.as_ref())
+                    .fetch(&mut this.input, predicate_projection, selection.as_ref())
                     .await?;
 
                 let array_reader = build_array_reader(
-                    self.fields.as_ref(),
+                    this.fields.as_ref(),
                     predicate_projection,
                     &row_group,
                 )?;
@@ -419,40 +430,41 @@ where
         }
 
         if !selects_any(selection.as_ref()) {
-            return Ok((self, None));
+            return Ok(None);
         }
 
         row_group
-            .fetch(&mut self.input, &projection, selection.as_ref())
+            .fetch(&mut this.input, &projection, selection.as_ref())
             .await?;
 
         let reader = ParquetRecordBatchReader::new(
             batch_size,
-            build_array_reader(self.fields.as_ref(), &projection, &row_group)?,
+            build_array_reader(this.fields.as_ref(), &projection, &row_group)?,
             selection,
         );
 
-        Ok((self, Some(reader)))
+        Ok(Some(reader))
     }
 }
 
-enum StreamState<T> {
+enum StreamState {
     /// At the start of a new row group, or the end of the parquet stream
     Init,
     /// Decoding a batch
     Decoding(ParquetRecordBatchReader),
     /// Reading data from input
-    Reading(BoxFuture<'static, ReadResult<T>>),
+    // Reading(BoxFuture<'static, ReadResult<T>>),
+    Reading,
     /// Error
     Error,
 }
 
-impl<T> std::fmt::Debug for StreamState<T> {
+impl std::fmt::Debug for StreamState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             StreamState::Init => write!(f, "StreamState::Init"),
             StreamState::Decoding(_) => write!(f, "StreamState::Decoding"),
-            StreamState::Reading(_) => write!(f, "StreamState::Reading"),
+            StreamState::Reading => write!(f, "StreamState::Reading"),
             StreamState::Error => write!(f, "StreamState::Error"),
         }
     }
@@ -474,9 +486,13 @@ pub struct ParquetRecordBatchStream<T> {
     selection: Option<RowSelection>,
 
     /// This is an option so it can be moved into a future
-    reader: Option<ReaderFactory<T>>,
+    reader: Arc<ReaderFactory<T>>,
 
-    state: StreamState<T>,
+    state: StreamState,
+
+    row_groups_read_queue: FuturesOrdered<Pin<Box<dyn Future<Output = ReadResult> + Send + 'static>>>,
+
+    prefetch: usize,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
@@ -487,6 +503,7 @@ impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
             .field("batch_size", &self.batch_size)
             .field("projection", &self.projection)
             .field("state", &self.state)
+            .field("prefetch", &self.prefetch)
             .finish()
     }
 }
@@ -518,36 +535,47 @@ where
                             e.to_string(),
                         ))));
                     }
-                    None => self.state = StreamState::Init,
+                    None => {
+                        println!("Decoding finished");
+                        self.state = StreamState::Init
+                    },
                 },
                 StreamState::Init => {
-                    let row_group_idx = match self.row_groups.pop_front() {
-                        Some(idx) => idx,
-                        None => return Poll::Ready(None),
-                    };
+                    while self.row_groups_read_queue.len() < self.prefetch {
+                        let row_group_idx = match self.row_groups.pop_front() {
+                            Some(idx) => idx,
+                            None => {
+                                if self.row_groups_read_queue.is_empty() {
+                                    return Poll::Ready(None)
+                                } else {
+                                    break;
+                                }
+                            },
+                        };
 
-                    let reader = self.reader.take().expect("lost reader");
+                        let row_count =
+                            self.metadata.row_group(row_group_idx).num_rows() as usize;
 
-                    let row_count =
-                        self.metadata.row_group(row_group_idx).num_rows() as usize;
+                        let selection =
+                            self.selection.as_mut().map(|s| s.split_off(row_count));
 
-                    let selection =
-                        self.selection.as_mut().map(|s| s.split_off(row_count));
-
-                    let fut = reader
-                        .read_row_group(
-                            row_group_idx,
-                            selection,
-                            self.projection.clone(),
-                            self.batch_size,
-                        )
-                        .boxed();
-
-                    self.state = StreamState::Reading(fut)
+                        unsafe {
+                            println!("Call ReaderFactory::read_row_group {}", row_group_idx);
+                            let fut = self.reader.clone()
+                                .read_row_group(
+                                    row_group_idx,
+                                    selection,
+                                    self.projection.clone(),
+                                    self.batch_size,
+                                )
+                                .boxed();
+                            self.row_groups_read_queue.push_back(fut);
+                        } // unsafe
+                    } // while
+                    self.state = StreamState::Reading
                 }
-                StreamState::Reading(f) => match ready!(f.poll_unpin(cx)) {
-                    Ok((reader_factory, maybe_reader)) => {
-                        self.reader = Some(reader_factory);
+                StreamState::Reading => match ready!(self.row_groups_read_queue.poll_next_unpin(cx)) {
+                    Some(Ok(maybe_reader)) => {
                         match maybe_reader {
                             // Read records from [`ParquetRecordBatchReader`]
                             Some(reader) => self.state = StreamState::Decoding(reader),
@@ -555,9 +583,12 @@ where
                             None => self.state = StreamState::Init,
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         self.state = StreamState::Error;
                         return Poll::Ready(Some(Err(e)));
+                    }
+                    None => {
+                        return Poll::Ready(None)
                     }
                 },
                 StreamState::Error => return Poll::Pending,
@@ -1292,12 +1323,12 @@ mod tests {
         let projection =
             ProjectionMask::leaves(metadata.file_metadata().schema_descr(), vec![0]);
 
-        let reader_factory = ReaderFactory {
+        let mut reader_factory = Arc::new(ReaderFactory {
             metadata,
             fields,
             input: async_reader,
             filter: None,
-        };
+        });
 
         let mut skip = true;
         let mut pages = offset_index[0].iter().peekable();
@@ -1325,10 +1356,12 @@ mod tests {
 
         let selection = RowSelection::from(selectors);
 
-        let (_factory, _reader) = reader_factory
-            .read_row_group(0, Some(selection), projection.clone(), 48)
-            .await
-            .expect("reading row group");
+        unsafe {
+            let _reader = reader_factory
+                .read_row_group(0, Some(selection), projection.clone(), 48)
+                .await
+                .expect("reading row group");
+        }
 
         let requests = requests.lock().unwrap();
 
