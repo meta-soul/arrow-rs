@@ -33,7 +33,7 @@ jobs:
     name: Test on Mac
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Install protoc with brew
@@ -56,7 +56,7 @@ jobs:
     name: Test on Windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Install protobuf compiler in /d/protoc
@@ -89,7 +89,7 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
       - name: Setup rustfmt
